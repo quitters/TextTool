@@ -6,8 +6,76 @@ import cv2
 import numpy as np
 import time
 import threading
+import uuid
 from PIL import Image
 from typing import Dict, List, Any, Tuple, Optional
+import math
+
+
+class TextRegion:
+    """
+    Represents a region in an image where text can be placed.
+    """
+    
+    def __init__(self, x: int, y: int, width: int, height: int, score: float = 1.0, id: str = None):
+        """
+        Initialize a text region with position, size, and confidence score
+        
+        Args:
+            x: X-coordinate of top-left corner
+            y: Y-coordinate of top-left corner
+            width: Width of region
+            height: Height of region
+            score: Confidence score (0.0 to 1.0)
+            id: Unique identifier for the region (auto-generated if None)
+        """
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.score = score
+        # Fix the id parameter name conflict with the built-in id function
+        self.id = id if id is not None else f"region_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    
+    def get_bbox(self) -> Tuple[int, int, int, int]:
+        """
+        Get the bounding box as (x, y, width, height)
+        """
+        return (self.x, self.y, self.width, self.height)
+    
+    def get_center(self) -> Tuple[int, int]:
+        """
+        Get the center point of the region
+        """
+        return (self.x + self.width // 2, self.y + self.height // 2)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert region to dictionary for serialization
+        """
+        return {
+            "id": self.id,
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "score": self.score
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TextRegion':
+        """
+        Create a TextRegion from a dictionary
+        """
+        return cls(
+            x=data["x"],
+            y=data["y"],
+            width=data["width"],
+            height=data["height"],
+            score=data.get("score", 1.0),
+            id=data.get("id")
+        )
+
 
 from ai_analysis.image_analyzer import ImageAnalyzer
 from ai_analysis.region_proposal import RegionProposer
@@ -120,137 +188,118 @@ class TextPlacementPipeline:
             # Sleep for the interval
             time.sleep(interval)
         
-    def process_image(self, image_path: str, text_length: int = 20) -> List[Dict[str, Any]]:
-        """Process an image to identify potential text placement regions
+    def process_image(self, image_path: str, text_length: int = 20) -> Dict[str, Any]:
+        """
+        Process an image to find suitable text placement regions
         
         Args:
             image_path: Path to the image file
             text_length: Approximate length of text to be placed
             
         Returns:
-            List of dictionaries containing region information
+            Dictionary with region proposals
         """
-        try:
-            # Send initial progress update
+        # Check if image exists
+        if not os.path.exists(image_path):
             if self.debug_callback:
                 self.debug_callback({
-                    "status": "progress", 
-                    "message": f"Starting analysis of {os.path.basename(image_path)}", 
-                    "step": "start", 
-                    "percent": 0
+                    "status": "error", 
+                    "message": f"Image not found: {image_path}"
                 })
-                time.sleep(0.1)  # Small delay to ensure UI updates
-            
-            # Step 1: Load the image
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        
+        # Reset state
+        self.current_image = None
+        self.current_regions = []
+        self.current_proposals = []
+        
+        try:
+            # Load the image
             if self.debug_callback:
                 self.debug_callback({
                     "status": "progress", 
                     "message": "Loading image...", 
-                    "step": "load_image", 
+                    "step": "loading", 
                     "percent": 10
                 })
-                time.sleep(0.1)
             
-            # Load the image
+            # Load image with OpenCV
             img = cv2.imread(image_path)
             if img is None:
                 if self.debug_callback:
                     self.debug_callback({
-                        "status": "error",
-                        "message": f"Failed to load image: {image_path}",
-                        "step": "error",
-                        "percent": 0
+                        "status": "error", 
+                        "message": f"Failed to load image: {image_path}"
                     })
-                return []
+                raise ValueError(f"Failed to load image: {image_path}")
+                
+            # Convert BGR to RGB
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # Get image dimensions
+            # Store image dimensions
             height, width = img.shape[:2]
+            
+            # Store the current image
+            self.current_image = img_rgb
             
             # Update progress
             if self.debug_callback:
                 self.debug_callback({
                     "status": "progress", 
-                    "message": f"Image loaded ({width}x{height})", 
-                    "step": "processing", 
+                    "message": "Image loaded successfully", 
+                    "step": "loaded", 
                     "percent": 20
                 })
-                time.sleep(0.1)
             
-            # Step 2: Analyze the image (simplified approach)
-            if self.debug_callback:
-                self.debug_callback({
-                    "status": "progress", 
-                    "message": "Analyzing image...", 
-                    "step": "analyzing", 
-                    "percent": 40
-                })
-                time.sleep(0.1)
-            
-            # Use a simple approach to find regions
-            # This is a simplified version that won't get stuck
-            regions = []
-            
+            # Analyze the image
             try:
-                # Try to use the image analyzer if available
-                if hasattr(self, 'image_analyzer') and self.image_analyzer is not None:
-                    # Update progress
+                if self.debug_callback:
+                    self.debug_callback({
+                        "status": "progress", 
+                        "message": "Analyzing image...", 
+                        "step": "analyzing", 
+                        "percent": 60
+                    })
+                
+                # Set a timeout for analysis
+                max_time = 30  # seconds
+                start_time = time.time()
+                
+                # Run analysis in a separate thread with timeout
+                analysis_result = [None]
+                analysis_done = [False]
+                
+                def run_analysis():
+                    try:
+                        analysis_result[0] = self.image_analyzer.fast_analyze(image_path)
+                        analysis_done[0] = True
+                    except Exception as e:
+                        print(f"Analysis error: {str(e)}")
+                
+                analysis_thread = threading.Thread(target=run_analysis)
+                analysis_thread.daemon = True
+                analysis_thread.start()
+                
+                # Wait for analysis to complete or timeout
+                while not analysis_done[0] and time.time() - start_time < max_time:
+                    # Update progress while waiting
+                    progress = min(80, 60 + int((time.time() - start_time) / max_time * 20))
                     if self.debug_callback:
                         self.debug_callback({
                             "status": "progress", 
-                            "message": "Running image analysis...", 
+                            "message": f"Analyzing image... ({int(time.time() - start_time)}s)", 
                             "step": "analyzing", 
-                            "percent": 60
+                            "percent": progress
                         })
-                    
-                    # Set a timeout for analysis
-                    max_time = 30  # seconds
-                    start_time = time.time()
-                    
-                    # Run analysis in a separate thread with timeout
-                    analysis_result = [None]
-                    analysis_done = [False]
-                    
-                    def run_analysis():
-                        try:
-                            analysis_result[0] = self.image_analyzer.fast_analyze(image_path)
-                            analysis_done[0] = True
-                        except Exception as e:
-                            print(f"Analysis error: {str(e)}")
-                    
-                    analysis_thread = threading.Thread(target=run_analysis)
-                    analysis_thread.daemon = True
-                    analysis_thread.start()
-                    
-                    # Wait for analysis to complete or timeout
-                    while not analysis_done[0] and time.time() - start_time < max_time:
-                        # Update progress while waiting
-                        progress = min(80, 60 + int((time.time() - start_time) / max_time * 20))
-                        if self.debug_callback:
-                            self.debug_callback({
-                                "status": "progress", 
-                                "message": f"Analyzing image... ({int(time.time() - start_time)}s)", 
-                                "step": "analyzing", 
-                                "percent": progress
-                            })
-                        time.sleep(1)
-                    
-                    # Check if analysis completed
-                    if analysis_done[0] and analysis_result[0]:
-                        regions = analysis_result[0]
-                    else:
-                        # Fallback to simple region if analysis timed out
-                        print("Analysis timed out or failed, using fallback")
-                        # Create a default region in the center
-                        center_region = TextRegion(
-                            x=int(width * 0.2),
-                            y=int(height * 0.2),
-                            width=int(width * 0.6),
-                            height=int(height * 0.6),
-                            score=0.8
-                        )
-                        regions = [center_region]
+                    time.sleep(1)
+                
+                # Check if analysis completed
+                if analysis_done[0] and analysis_result[0]:
+                    regions = analysis_result[0]
                 else:
-                    # No analyzer available, use fallback
+                    # Fallback to simple region if analysis timed out
+                    print("Analysis timed out or failed, using fallback")
+                    # Create a default region in the center
                     center_region = TextRegion(
                         x=int(width * 0.2),
                         y=int(height * 0.2),
@@ -259,9 +308,10 @@ class TextPlacementPipeline:
                         score=0.8
                     )
                     regions = [center_region]
+                
             except Exception as e:
                 print(f"Error during analysis: {str(e)}")
-                # Create a default region in the center
+                # Fallback to simple region
                 center_region = TextRegion(
                     x=int(width * 0.2),
                     y=int(height * 0.2),
@@ -271,65 +321,65 @@ class TextPlacementPipeline:
                 )
                 regions = [center_region]
             
-            # Update progress
+            # Convert regions to dictionaries for UI consumption
+            region_dicts = self._convert_regions_to_dicts(regions)
+            
+            # Store the current regions
+            self.current_regions = regions
+            
+            # Generate proposals from regions
             if self.debug_callback:
                 self.debug_callback({
                     "status": "progress", 
-                    "message": f"Found {len(regions)} potential regions", 
-                    "step": "finalizing", 
+                    "message": "Generating text placement proposals...", 
+                    "step": "proposals", 
                     "percent": 90
                 })
-                time.sleep(0.1)
             
-            # Step 3: Prepare the results
-            result = []
-            for i, region in enumerate(regions):
-                result.append({
-                    "id": i,
-                    "x": region.x,
-                    "y": region.y,
-                    "width": region.width,
-                    "height": region.height,
-                    "score": region.score
-                })
+            # For now, just use the regions as proposals
+            self.current_proposals = region_dicts
             
-            # Final progress update
-            if self.debug_callback:
-                self.debug_callback({
-                    "status": "progress", 
-                    "message": "Analysis complete", 
-                    "step": "complete", 
-                    "percent": 100
-                })
-                time.sleep(0.1)
-            
-            return result
+            # Return the proposals
+            return {"proposals": region_dicts}
             
         except Exception as e:
-            # Handle any exceptions
-            error_msg = f"Error processing image: {str(e)}"
-            print(f"ERROR: {error_msg}")
-            
-            # Send error message
             if self.debug_callback:
                 self.debug_callback({
-                    "status": "error",
-                    "message": error_msg,
-                    "step": "error",
-                    "percent": 0
+                    "status": "error", 
+                    "message": f"Error processing image: {str(e)}"
                 })
-                
-                # Always send a completion message
-                self.debug_callback({
-                    "status": "progress", 
-                    "message": "Analysis failed", 
-                    "step": "complete", 
-                    "percent": 100
-                })
-            
-            return []
+            raise e
     
-    def render_preview(self, image_path: str, proposal_id: int, text: str,
+    def _convert_regions_to_dicts(self, regions) -> List[Dict[str, Any]]:
+        """
+        Convert a list of TextRegion objects to dictionaries
+        
+        Args:
+            regions: List of TextRegion objects or dictionaries
+            
+        Returns:
+            List of dictionaries with region data
+        """
+        result = []
+        for i, region in enumerate(regions):
+            if hasattr(region, 'to_dict'):
+                # It's a TextRegion object
+                region_dict = region.to_dict()
+            elif isinstance(region, dict):
+                # It's already a dictionary
+                region_dict = region.copy()
+                # Ensure it has an ID
+                if 'id' not in region_dict:
+                    region_dict['id'] = f"region_{i+1}"
+            else:
+                # Skip invalid regions
+                continue
+                
+            result.append(region_dict)
+        
+        return result
+    
+    def render_preview(self, image_path: str, proposal_id: str, text: str,
                      custom_styling: Optional[Dict[str, Any]] = None) -> Image.Image:
         """
         Render a preview of text placed according to a selected proposal
@@ -345,19 +395,60 @@ class TextPlacementPipeline:
         """
         # Find the selected proposal
         selected_proposal = None
+        
+        # Print debug info
+        print(f"Rendering preview with proposal ID: {proposal_id}")
+        print(f"Current proposals: {[p.get('id') if isinstance(p, dict) else 'unknown' for p in self.current_proposals]}")
+        
         for proposal in self.current_proposals:
-            if proposal["id"] == proposal_id:
+            if isinstance(proposal, dict) and str(proposal.get("id")) == str(proposal_id):
                 selected_proposal = proposal
+                print(f"Found matching proposal: {proposal}")
                 break
                 
         if selected_proposal is None:
-            raise ValueError(f"No proposal found with ID {proposal_id}")
+            # If not found in current proposals, check if it's a direct dictionary
+            if isinstance(proposal_id, dict):
+                selected_proposal = proposal_id
+            else:
+                # Create a default region if no proposal is found
+                img = cv2.imread(image_path)
+                if img is not None:
+                    height, width = img.shape[:2]
+                    selected_proposal = {
+                        "id": "default_center",
+                        "x": int(width * 0.2),
+                        "y": int(height * 0.2),
+                        "width": int(width * 0.6),
+                        "height": int(height * 0.6),
+                        "score": 1.0
+                    }
+                    print(f"Created default proposal: {selected_proposal}")
+                else:
+                    raise ValueError(f"No proposal found with ID {proposal_id} and could not create default")
             
-        # Extract region and styling information
-        region = selected_proposal["region"]
-        styling = selected_proposal["styling"]
+        # Create region dictionary from proposal
+        region = {
+            "x": selected_proposal.get("x", 0),
+            "y": selected_proposal.get("y", 0),
+            "width": selected_proposal.get("width", 100),
+            "height": selected_proposal.get("height", 100)
+        }
+        
+        # Default styling
+        default_styling = {
+            "font": "Arial",
+            "font_size": 24,
+            "color": "#000000",
+            "outline_color": "#FFFFFF",
+            "outline_width": 2,
+            "shadow": False,
+            "opacity": 1.0,
+            "alignment": "center"
+        }
         
         # Merge custom styling if provided
+        styling = default_styling
         if custom_styling:
             styling = {**styling, **custom_styling}
             
@@ -365,27 +456,49 @@ class TextPlacementPipeline:
         return self.text_renderer.render_text(image_path, text, region, styling)
     
     def render_final(self, image_path: str, text: str, region: Dict[str, Any],
-                   styling: Dict[str, Any], output_path: str) -> str:
+                   styling: Dict[str, Any], output_path: str, quality: int = 95) -> str:
         """
-        Render the final output with text placed according to specified parameters
+        Render the final image with text and save to file
         
         Args:
             image_path: Path to the input image
             text: Text to render
-            region: Dictionary with region information
-            styling: Dictionary with styling information
-            output_path: Path where to save the output
+            region: Dictionary with region parameters (x, y, width, height)
+            styling: Dictionary with styling parameters
+            output_path: Path to save the output image
+            quality: JPEG quality (1-100)
             
         Returns:
-            Path to the rendered output
+            Path to the saved image
         """
-        # Render the text
-        rendered = self.text_renderer.render_text(image_path, text, region, styling)
-        
-        # Save the output
-        self.text_renderer.save_output(rendered, output_path)
-        
-        return output_path
+        try:
+            # Load the image
+            img = Image.open(image_path).convert("RGBA")
+            
+            # Create renderer
+            renderer = self.text_renderer
+            
+            # Print debug info
+            print(f"Rendering final image with region: {region}")
+            print(f"Styling parameters: {styling}")
+            
+            # Render text on image
+            result = renderer.render_text(
+                image_path,
+                text,
+                region,
+                styling
+            )
+            
+            # Save the result
+            self.text_renderer.save_output(result, output_path, quality=quality)
+            
+            return output_path
+        except Exception as e:
+            print(f"Error in render_final: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def get_visualization(self, image_path: str, proposals: List[Dict[str, Any]] = None) -> np.ndarray:
         """
@@ -513,7 +626,15 @@ class TextPlacementPipeline:
             
             # Log completion
             elapsed_time = time.time() - start_time
-            self.log(f"Visualization generated in {elapsed_time:.2f} seconds")
+            
+            # Log success with highlight
+            success_msg = f"Visualization generated in {elapsed_time:.2f} seconds"
+            self.log({
+                "status": "highlight",
+                "message": success_msg,
+                "step": "visualization_complete",
+                "percent": 100
+            })
             
             # Send completion update
             if self.debug_callback:

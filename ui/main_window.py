@@ -3,20 +3,20 @@ Main Window UI Module for Intelligent Text Placement (Tkinter version)
 """
 import sys
 import os
+import time
+import queue
+import threading
+import traceback
+from typing import Dict, Any, List, Tuple, Optional, Union
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, scrolledtext
 from tkinter import messagebox
-import threading
-import queue
-import time
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import math
-from typing import Dict, List, Any, Optional, Tuple
-
 from workflow.pipeline import TextPlacementPipeline
-
+from tkinter import colorchooser
 
 class BackgroundTask(threading.Thread):
     """Base class for background tasks"""
@@ -47,7 +47,7 @@ class ImageAnalysisTask(BackgroundTask):
         self.text_length = text_length
         self.progress_updates = []
         self.last_update_time = time.time()
-        self.watchdog_active = False
+        self.has_completed = False
     
     def run(self):
         """Execute the task in a separate thread"""
@@ -55,6 +55,7 @@ class ImageAnalysisTask(BackgroundTask):
             # Simple debug callback to track progress
             def debug_callback(data):
                 if isinstance(data, dict) and "status" in data:
+                    # Put progress updates in the queue
                     self.queue.put((False, data))
                     self.progress_updates.append(data)
                     self.last_update_time = time.time()
@@ -75,6 +76,15 @@ class ImageAnalysisTask(BackgroundTask):
                 # Simplified approach - just call process_image and let it handle progress updates
                 result = self.pipeline.process_image(self.image_path, self.text_length)
                 
+                # Format the result as a dictionary with proposals
+                if isinstance(result, list):
+                    formatted_result = {
+                        "proposals": result,
+                        "log": self.progress_updates.copy()
+                    }
+                else:
+                    formatted_result = result
+                
                 # Send completion update
                 debug_callback({
                     "status": "progress", 
@@ -84,12 +94,14 @@ class ImageAnalysisTask(BackgroundTask):
                 })
                 
                 # Return the result
-                self.queue.put((True, result))
+                self.queue.put((True, formatted_result))
+                self.has_completed = True
                 
             except Exception as e:
                 # Log the error
                 error_msg = f"Error processing image: {str(e)}"
                 print(f"ERROR: {error_msg}")
+                traceback.print_exc()
                 
                 # Send error message to UI
                 debug_callback({
@@ -108,25 +120,32 @@ class ImageAnalysisTask(BackgroundTask):
                 })
                 
                 # Return empty result
-                self.queue.put((True, []))
+                self.queue.put((True, {"proposals": [], "error": str(e), "log": self.progress_updates.copy()}))
+                self.has_completed = True
                 
         except Exception as e:
             # Catch any other exceptions
             error_msg = f"Unexpected error in analysis task: {str(e)}"
             print(f"CRITICAL ERROR: {error_msg}")
-            self.queue.put((True, []))
+            traceback.print_exc()
+            self.queue.put((True, {"proposals": [], "error": str(e)}))
+            self.has_completed = True
     
     def get_result(self):
         """Get the latest result or progress update"""
-        if not self.queue.empty():
-            return self.queue.get()
-        
-        # If there are progress updates but nothing in the queue,
-        # return the latest progress update
-        if self.progress_updates:
-            return (False, self.progress_updates[-1])
-        
-        return None
+        try:
+            if not self.queue.empty():
+                return self.queue.get_nowait()
+            
+            # If there are progress updates but nothing in the queue,
+            # return the latest progress update
+            if self.progress_updates and not self.has_completed:
+                return (False, self.progress_updates[-1])
+            
+            return None
+        except Exception as e:
+            print(f"Error getting result: {e}")
+            return None
 
 
 class RenderPreviewTask(BackgroundTask):
@@ -156,15 +175,20 @@ class RenderPreviewTask(BackgroundTask):
 
 
 class ProposalItem:
-    """Class for storing proposal information"""
+    """Class to represent a region proposal in the UI"""
     
-    def __init__(self, proposal: Dict[str, Any]):
-        self.proposal = proposal
-        self.id = proposal['id']
-        self.score = proposal['score']
+    def __init__(self, proposal):
+        """Initialize with a proposal dictionary"""
+        self.id = proposal.get("id", "unknown")
+        self.x = proposal.get("x", 0)
+        self.y = proposal.get("y", 0)
+        self.width = proposal.get("width", 0)
+        self.height = proposal.get("height", 0)
+        self.score = proposal.get("score", 0.0)
         
     def __str__(self):
-        return f"Region {self.id} (Score: {self.score:.2f})"
+        """String representation for display in listbox"""
+        return f"{self.id} (Score: {self.score:.2f}) - [{self.x},{self.y},{self.width}x{self.height}]"
 
 
 class MainWindow(tk.Frame):
@@ -180,9 +204,10 @@ class MainWindow(tk.Frame):
         self.pipeline = TextPlacementPipeline(dpi=300, debug=True)
         
         # Initialize state variables
-        self.image_path = None
+        self.current_image_path = None
         self.current_proposals = []
         self.selected_proposal = None
+        self.selected_proposal_obj = None
         self.preview_image = None
         self.text_color = "#000000"  # Black
         self.outline_color = "#FFFFFF"  # White
@@ -302,7 +327,7 @@ class MainWindow(tk.Frame):
         ttk.Label(styling_frame, text="Font:").grid(column=0, row=0, sticky=tk.W, padx=5, pady=2)
         self.font_var = tk.StringVar(value="Arial")
         self.font_combo = ttk.Combobox(styling_frame, textvariable=self.font_var, state="readonly")
-        self.font_combo['values'] = ("Arial", "Times New Roman", "Courier New", "Verdana", "Georgia")
+        self.font_combo['values'] = ("Arial", "Times New Roman", "Courier New", "Verdana", "Georgia", "Helvetica", "Tahoma", "Trebuchet MS")
         self.font_combo.grid(column=1, row=0, sticky=(tk.W, tk.E), padx=5, pady=2)
         self.font_combo.bind("<<ComboboxSelected>>", self.on_styling_changed)
         
@@ -317,60 +342,133 @@ class MainWindow(tk.Frame):
         
         # Text color
         ttk.Label(styling_frame, text="Color:").grid(column=0, row=2, sticky=tk.W, padx=5, pady=2)
-        self.color_btn = ttk.Button(styling_frame, text="      ", command=self.on_color_select)
-        self.color_btn.grid(column=1, row=2, sticky=tk.W, padx=5, pady=2)
+        color_frame = ttk.Frame(styling_frame)
+        color_frame.grid(column=1, row=2, sticky=tk.W, padx=5, pady=2)
         
-        # Create a colored canvas behind the button
-        self.color_indicator = tk.Canvas(self.color_btn, width=20, height=20, bg=self.text_color)
-        self.color_indicator.place(x=5, y=2)
+        # Create a button with color indicator
+        self.color_indicator = tk.Canvas(color_frame, width=20, height=20, bg=self.text_color, 
+                                       highlightthickness=1, highlightbackground="black")
+        self.color_indicator.pack(side=tk.LEFT, padx=2)
+        
+        color_pick_btn = ttk.Button(color_frame, text="Choose Color", command=self.on_color_select)
+        color_pick_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Opacity slider
+        ttk.Label(styling_frame, text="Opacity:").grid(column=0, row=3, sticky=tk.W, padx=5, pady=2)
+        self.opacity_var = tk.DoubleVar(value=1.0)
+        opacity_slider = ttk.Scale(styling_frame, from_=0.1, to=1.0, variable=self.opacity_var, 
+                                  orient=tk.HORIZONTAL, command=self.on_styling_changed)
+        opacity_slider.grid(column=1, row=3, sticky=(tk.W, tk.E), padx=5, pady=2)
         
         # Outline
         self.outline_var = tk.BooleanVar(value=False)
         outline_check = ttk.Checkbutton(styling_frame, text="Outline", variable=self.outline_var, 
                                        command=self.on_styling_changed)
-        outline_check.grid(column=0, row=3, sticky=tk.W, padx=5, pady=2)
+        outline_check.grid(column=0, row=4, sticky=tk.W, padx=5, pady=2)
         
-        self.outline_btn = ttk.Button(styling_frame, text="      ", command=self.on_outline_color_select, 
-                                     state=tk.DISABLED)
-        self.outline_btn.grid(column=1, row=3, sticky=tk.W, padx=5, pady=2)
+        outline_frame = ttk.Frame(styling_frame)
+        outline_frame.grid(column=1, row=4, sticky=tk.W, padx=5, pady=2)
         
-        # Create a colored canvas for outline
-        self.outline_indicator = tk.Canvas(self.outline_btn, width=20, height=20, bg=self.outline_color)
-        self.outline_indicator.place(x=5, y=2)
+        # Create a canvas for outline color indicator
+        self.outline_indicator = tk.Canvas(outline_frame, width=20, height=20, bg=self.outline_color,
+                                         highlightthickness=1, highlightbackground="black")
+        self.outline_indicator.pack(side=tk.LEFT, padx=2)
+        
+        self.outline_btn = ttk.Button(outline_frame, text="Choose Color", 
+                                    command=self.on_outline_color_select)
+        self.outline_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Outline width
+        ttk.Label(styling_frame, text="Outline Width:").grid(column=0, row=5, sticky=tk.W, padx=5, pady=2)
+        self.outline_width_var = tk.IntVar(value=1)
+        outline_width_spin = ttk.Spinbox(styling_frame, from_=1, to=10, textvariable=self.outline_width_var, width=5)
+        outline_width_spin.grid(column=1, row=5, sticky=tk.W, padx=5, pady=2)
+        outline_width_spin.bind("<KeyRelease>", self.on_styling_changed)
+        outline_width_spin.bind("<<Increment>>", self.on_styling_changed)
+        outline_width_spin.bind("<<Decrement>>", self.on_styling_changed)
         
         # Shadow
         self.shadow_var = tk.BooleanVar(value=False)
         shadow_check = ttk.Checkbutton(styling_frame, text="Shadow", variable=self.shadow_var, 
                                       command=self.on_styling_changed)
-        shadow_check.grid(column=0, row=4, sticky=tk.W, padx=5, pady=2)
+        shadow_check.grid(column=0, row=6, sticky=tk.W, padx=5, pady=2)
+        
+        # Shadow blur
+        ttk.Label(styling_frame, text="Shadow Blur:").grid(column=0, row=7, sticky=tk.W, padx=5, pady=2)
+        self.shadow_blur_var = tk.IntVar(value=5)
+        shadow_blur_spin = ttk.Spinbox(styling_frame, from_=1, to=20, textvariable=self.shadow_blur_var, width=5)
+        shadow_blur_spin.grid(column=1, row=7, sticky=tk.W, padx=5, pady=2)
+        shadow_blur_spin.bind("<KeyRelease>", self.on_styling_changed)
+        shadow_blur_spin.bind("<<Increment>>", self.on_styling_changed)
+        shadow_blur_spin.bind("<<Decrement>>", self.on_styling_changed)
+        
+        # Blend mode
+        ttk.Label(styling_frame, text="Blend Mode:").grid(column=0, row=8, sticky=tk.W, padx=5, pady=2)
+        self.blend_mode_var = tk.StringVar(value="normal")
+        self.blend_mode_combo = ttk.Combobox(styling_frame, textvariable=self.blend_mode_var, state="readonly")
+        self.blend_mode_combo['values'] = ("Normal", "Multiply", "Screen", "Overlay")
+        self.blend_mode_combo.current(0)  # Normal by default
+        self.blend_mode_combo.grid(column=1, row=8, sticky=(tk.W, tk.E), padx=5, pady=2)
+        self.blend_mode_combo.bind("<<ComboboxSelected>>", self.on_styling_changed)
+        
+        # Text warping
+        self.warp_var = tk.BooleanVar(value=False)
+        warp_check = ttk.Checkbutton(styling_frame, text="Apply Warping", variable=self.warp_var, 
+                                    command=self.on_styling_changed)
+        warp_check.grid(column=0, row=9, sticky=tk.W, padx=5, pady=2)
+        
+        # Warp type
+        ttk.Label(styling_frame, text="Warp Type:").grid(column=0, row=10, sticky=tk.W, padx=5, pady=2)
+        self.warp_type_var = tk.StringVar(value="perspective")
+        self.warp_type_combo = ttk.Combobox(styling_frame, textvariable=self.warp_type_var, state="readonly")
+        self.warp_type_combo['values'] = ("Perspective", "Arc", "Wave")
+        self.warp_type_combo.current(0)  # Perspective by default
+        self.warp_type_combo.grid(column=1, row=10, sticky=(tk.W, tk.E), padx=5, pady=2)
+        self.warp_type_combo.bind("<<ComboboxSelected>>", self.on_styling_changed)
+        
+        # Warp strength
+        ttk.Label(styling_frame, text="Warp Strength:").grid(column=0, row=11, sticky=tk.W, padx=5, pady=2)
+        self.warp_strength_var = tk.DoubleVar(value=0.2)
+        warp_strength_slider = ttk.Scale(styling_frame, from_=0.1, to=0.5, variable=self.warp_strength_var, 
+                                       orient=tk.HORIZONTAL, command=self.on_styling_changed)
+        warp_strength_slider.grid(column=1, row=11, sticky=(tk.W, tk.E), padx=5, pady=2)
         
         # Alignment
-        ttk.Label(styling_frame, text="Alignment:").grid(column=0, row=5, sticky=tk.W, padx=5, pady=2)
-        self.align_var = tk.StringVar(value="center")
+        ttk.Label(styling_frame, text="Alignment:").grid(column=0, row=12, sticky=tk.W, padx=5, pady=2)
+        self.align_var = tk.StringVar(value="Center")
         align_combo = ttk.Combobox(styling_frame, textvariable=self.align_var, state="readonly")
         align_combo['values'] = ("Left", "Center", "Right")
         align_combo.current(1)  # Center by default
-        align_combo.grid(column=1, row=5, sticky=(tk.W, tk.E), padx=5, pady=2)
+        align_combo.grid(column=1, row=12, sticky=(tk.W, tk.E), padx=5, pady=2)
         align_combo.bind("<<ComboboxSelected>>", self.on_styling_changed)
         
         # Export section
+        self.setup_export_section(parent)
+        
+    def setup_export_section(self, parent):
+        """Setup the export section of the UI"""
         export_frame = ttk.LabelFrame(parent, text="Export")
         export_frame.grid(column=0, row=3, sticky=(tk.W, tk.E), padx=5, pady=5)
         export_frame.columnconfigure(0, weight=1)
         export_frame.columnconfigure(1, weight=1)
         
-        # Resolution selection
+        # DPI selection
         ttk.Label(export_frame, text="Resolution (DPI):").grid(column=0, row=0, sticky=tk.W, padx=5, pady=2)
-        self.dpi_var = tk.StringVar(value="300 (High Print)")
-        dpi_combo = ttk.Combobox(export_frame, textvariable=self.dpi_var, state="readonly")
-        dpi_combo['values'] = ("72 (Screen)", "150 (Low Print)", "300 (High Print)", "600 (Professional)")
-        dpi_combo.current(2)  # 300 DPI by default
-        dpi_combo.grid(column=1, row=0, sticky=(tk.W, tk.E), padx=5, pady=2)
+        self.dpi_var = tk.StringVar(value="300")
+        self.dpi_combo = ttk.Combobox(export_frame, textvariable=self.dpi_var, state="readonly")
+        self.dpi_combo['values'] = ("72", "150", "300", "600")
+        self.dpi_combo.current(2)  # 300 DPI by default
+        self.dpi_combo.grid(column=1, row=0, sticky=(tk.W, tk.E), padx=5, pady=2)
+        
+        # Quality selection for JPEG
+        ttk.Label(export_frame, text="JPEG Quality:").grid(column=0, row=1, sticky=tk.W, padx=5, pady=2)
+        self.quality_var = tk.IntVar(value=95)
+        quality_spin = ttk.Spinbox(export_frame, from_=1, to=100, textvariable=self.quality_var, width=5)
+        quality_spin.grid(column=1, row=1, sticky=tk.W, padx=5, pady=2)
         
         # Export button
-        self.export_btn = ttk.Button(export_frame, text="Export Image", 
-                                   command=self.on_export, state=tk.DISABLED)
-        self.export_btn.grid(column=0, row=1, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.export_btn = ttk.Button(export_frame, text="Export Image", command=self.on_export)
+        self.export_btn.grid(column=0, row=2, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=5)
         
     def setup_right_panel(self, parent):
         """Setup the right panel with image preview"""
@@ -418,7 +516,7 @@ class MainWindow(tk.Frame):
         )
         
         if file_path:
-            self.image_path = file_path
+            self.current_image_path = file_path
             self.image_path_var.set(os.path.basename(file_path))
             self.analyze_btn["state"] = tk.NORMAL
             
@@ -435,7 +533,7 @@ class MainWindow(tk.Frame):
     
     def on_analyze_image(self):
         """Handle image analysis"""
-        if not self.image_path:
+        if not self.current_image_path:
             return
             
         # Get text length for better region sizing
@@ -446,42 +544,105 @@ class MainWindow(tk.Frame):
         self.analyze_btn["state"] = tk.DISABLED
         self.status_var.set("Analyzing image...")
         
+        # Create progress bar
+        self.create_progress_bar()
+        
+        # Clear any existing proposals
+        self.proposals_list.delete(0, tk.END)
+        self.current_proposals = []
+        self.selected_proposal = None
+        self.export_btn["state"] = tk.DISABLED
+        
+        # Add a default centered proposal that's always available
+        self.add_default_proposal()
+        
         # Run analysis in a background thread
-        self.current_task = ImageAnalysisTask(self.pipeline, self.image_path, text_length)
-        self.current_task.start()
+        try:
+            self.current_task = ImageAnalysisTask(self.pipeline, self.current_image_path, text_length)
+            self.current_task.start()
+            
+            # Start checking for task completion
+            self.after(100, self.check_tasks)
+        except Exception as e:
+            self.status_var.set(f"Error starting analysis: {str(e)}")
+            self.analyze_btn["state"] = tk.NORMAL
+            self.remove_progress_bar()
+            messagebox.showerror("Analysis Error", f"Failed to start analysis: {str(e)}")
+            
+            # Even if analysis fails, we still have the default proposal
+            self.proposals_list.selection_set(0)
+            self.on_proposal_selected(None)
+            
+    def add_default_proposal(self):
+        """Add a default centered proposal that's always available"""
+        try:
+            # Get image dimensions
+            if self.current_image_path:
+                img = cv2.imread(self.current_image_path)
+                if img is not None:
+                    height, width = img.shape[:2]
+                    
+                    # Create a default centered proposal
+                    default_proposal = {
+                        "id": "default_center",
+                        "x": int(width * 0.2),
+                        "y": int(height * 0.2),
+                        "width": int(width * 0.6),
+                        "height": int(height * 0.6),
+                        "score": 1.0,
+                        "name": "Centered (Default)"
+                    }
+                    
+                    # Add to list of proposals
+                    self.current_proposals.append(default_proposal)
+                    
+                    # Add to listbox
+                    self.proposals_list.insert(tk.END, "Centered (Default)")
+                    
+                    # Enable the export button
+                    self.export_btn["state"] = tk.NORMAL
+                    
+                    return True
+            
+            return False
+        except Exception as e:
+            print(f"Error adding default proposal: {e}")
+            return False
     
     def on_analysis_complete(self, result):
         """Handle completion of image analysis"""
-        # Check if we received progress update or final result
+        # Check if the result is None or indicates an error
+        if result is None:
+            self.remove_progress_bar()
+            self.status_var.set("Analysis failed, using default region")
+            self.analyze_btn["state"] = tk.NORMAL
+            
+            # Ensure we have at least the default proposal selected
+            if self.proposals_list.size() > 0 and not self.selected_proposal:
+                self.proposals_list.selection_set(0)
+                self.on_proposal_selected(None)
+            return
+        
+        # Check if this is a progress update
         if isinstance(result, dict) and "status" in result and result["status"] == "progress":
-            # Update status with progress message
-            self.status_var.set(result["message"])
-            
-            # Update progress bar if percent is provided
-            if "percent" in result:
-                if not hasattr(self, "progress_bar") or self.progress_bar is None:
-                    # Create a progress bar if it doesn't exist
-                    self.create_progress_bar()
+            # Update progress bar
+            if hasattr(self, "progress_bar") and self.progress_bar is not None:
+                percent = result.get("percent", 0)
+                self.progress_bar["value"] = percent
                 
-                # Update the progress bar value
-                self.progress_bar["value"] = result["percent"]
+                # Update step label
+                step = result.get("step", "processing")
+                message = result.get("message", "Processing...")
+                self.progress_step_var.set(f"Step: {step.capitalize()} - {message}")
                 
-                # Force the UI to update
+                # Force update of UI
                 self.update_idletasks()
-                
-                # Update the step label if provided
-                if "step" in result:
-                    step_name = result["step"].capitalize()
-                    self.progress_step_var.set(f"Step: {step_name}")
             
-            # Add to debug log if it exists
-            if hasattr(self, "last_debug_log"):
-                if not isinstance(self.last_debug_log, list):
-                    self.last_debug_log = [self.last_debug_log]
-                self.last_debug_log.append(result)
-            else:
-                self.last_debug_log = [result]
-                
+            # Add to debug log
+            if not hasattr(self, "last_debug_log"):
+                self.last_debug_log = []
+            self.last_debug_log.append(result)
+            
             # Update debug window if it's open
             if hasattr(self, "debug_window") and self.debug_window is not None:
                 self.update_debug_log([result])
@@ -518,32 +679,59 @@ class MainWindow(tk.Frame):
             
             # Enable the debug button
             self.debug_btn["state"] = tk.NORMAL
-            
-            # Update debug window if it's open, otherwise show it
-            if hasattr(self, "debug_window") and self.debug_window is not None:
-                self.update_debug_log([completion_msg])
-            else:
-                self.show_debug_log(self.last_debug_log)
         else:
             # For backward compatibility
             proposals = result
             
-        self.current_proposals = proposals
+        # Ensure proposals is a list
+        if not isinstance(proposals, list):
+            proposals = []
+            
+        # Process the proposals to ensure they have the required fields
+        processed_proposals = []
+        for i, proposal in enumerate(proposals):
+            # If proposal is missing required fields, add them
+            if not isinstance(proposal, dict):
+                continue
+                
+            # Ensure proposal has an id
+            if 'id' not in proposal:
+                proposal['id'] = i + 1
+                
+            # Ensure proposal has a score
+            if 'score' not in proposal:
+                proposal['score'] = 0.5  # Default score
+                
+            processed_proposals.append(proposal)
+            
+        self.current_proposals = processed_proposals
         
         # Clear and populate the proposals list
-        self.proposals_list.delete(0, tk.END)
-        for proposal in proposals:
-            item = ProposalItem(proposal)
-            self.proposals_list.insert(tk.END, str(item))
+        self.proposals_list.delete(1, tk.END)  # Keep the default proposal
+        for proposal in processed_proposals:
+            try:
+                item = ProposalItem(proposal)
+                self.proposals_list.insert(tk.END, str(item))
+            except Exception as e:
+                print(f"Error adding proposal to list: {e}")
+                continue
         
-        # Generate and display visualization
-        viz_image = self.pipeline.get_visualization(self.image_path, proposals)
-        self.display_opencv_image(viz_image)
+        # Generate and display visualization in a separate thread to prevent UI freezing
+        def update_visualization():
+            try:
+                viz_image = self.pipeline.get_visualization(self.current_image_path, processed_proposals)
+                # Schedule UI update on the main thread
+                self.after(0, lambda: self.display_opencv_image(viz_image))
+            except Exception as e:
+                print(f"Error generating visualization: {e}")
+        
+        # Start visualization in a separate thread
+        threading.Thread(target=update_visualization, daemon=True).start()
         
         # Re-enable UI
         self.analyze_btn["state"] = tk.NORMAL
-        self.status_var.set(f"Analysis complete. Found {len(proposals)} potential text regions")
-        
+        self.status_var.set(f"Analysis complete. Found {len(processed_proposals)} potential text regions")
+    
     def create_progress_bar(self):
         """Create a progress bar to show analysis progress"""
         # Create a frame for the progress bar
@@ -757,21 +945,43 @@ class MainWindow(tk.Frame):
     
     def on_proposal_selected(self, event):
         """Handle selection of a region proposal"""
-        selection = self.proposals_list.curselection()
-        if not selection:
-            return
+        try:
+            # Get selected index
+            selection = self.proposals_list.curselection()
+            if not selection:
+                return
+                
+            index = selection[0]
+            selected_item = self.proposals_list.get(index)
             
-        index = selection[0]
-        if index < 0 or index >= len(self.current_proposals):
-            return
+            # Extract the ID from the selected item text
+            proposal_id = selected_item.split(" ")[0]
+            print(f"Selected proposal ID: {proposal_id}")
             
-        self.selected_proposal = self.current_proposals[index]
-        
-        # Update the preview with this region
-        self.update_preview()
-        
-        # Enable export button
-        self.export_btn["state"] = tk.NORMAL
+            # Find the corresponding proposal object
+            selected_proposal_obj = None
+            for proposal in self.current_proposals:
+                if isinstance(proposal, dict) and str(proposal.get("id")) == str(proposal_id):
+                    selected_proposal_obj = proposal
+                    break
+            
+            # Store the proposal ID and object
+            self.selected_proposal = proposal_id
+            self.selected_proposal_obj = selected_proposal_obj
+            
+            # Enable export button
+            self.export_btn["state"] = tk.NORMAL
+            
+            # Update preview
+            self.update_preview()
+            
+            # Update status
+            self.status_var.set(f"Selected region {proposal_id}")
+        except Exception as e:
+            print(f"Error selecting proposal: {e}")
+            import traceback
+            traceback.print_exc()
+            self.status_var.set(f"Error selecting proposal: {str(e)}")
     
     def on_text_changed(self, event=None):
         """Handle changes to the text input"""
@@ -780,65 +990,86 @@ class MainWindow(tk.Frame):
     
     def on_styling_changed(self, event=None):
         """Handle changes to styling options"""
-        # Update UI state for outline color
-        outline_enabled = self.outline_var.get()
-        self.outline_btn["state"] = tk.NORMAL if outline_enabled else tk.DISABLED
+        # Update outline button state
+        if self.outline_var.get():
+            self.outline_btn["state"] = tk.NORMAL
+            self.outline_indicator["state"] = tk.NORMAL
+        else:
+            self.outline_btn["state"] = tk.DISABLED
+            self.outline_indicator["state"] = tk.DISABLED
+            
+        # Update warp options state
+        if self.warp_var.get():
+            self.warp_type_combo["state"] = "readonly"
+        else:
+            self.warp_type_combo["state"] = tk.DISABLED
+            
+        # Update shadow options state
+        if self.shadow_var.get():
+            self.shadow_blur_var.set(self.shadow_blur_var.get())  # Trigger update
         
-        # Update preview if we have a selection
-        if self.selected_proposal:
-            self.update_preview()
-    
-    def on_color_select(self):
-        """Handle text color selection"""
-        color = colorchooser.askcolor(self.text_color, title="Select Text Color")
-        if color[1]:  # color is a tuple (RGB, hex)
-            self.text_color = color[1]
-            self.color_indicator.config(bg=self.text_color)
-            
-            if self.selected_proposal:
-                self.update_preview()
-    
-    def on_outline_color_select(self):
-        """Handle outline color selection"""
-        color = colorchooser.askcolor(self.outline_color, title="Select Outline Color")
-        if color[1]:  # color is a tuple (RGB, hex)
-            self.outline_color = color[1]
-            self.outline_indicator.config(bg=self.outline_color)
-            
-            if self.selected_proposal:
-                self.update_preview()
-    
+        # Trigger preview update
+        self.update_preview()
+        
     def update_preview(self):
         """Update the preview with current settings"""
-        if not self.selected_proposal or not self.image_path:
+        if not self.current_image_path or not self.selected_proposal:
             return
             
+        # Get current text
         text = self.text_input.get("1.0", tk.END).strip()
         if not text:
+            # Display the image without text
+            self.display_image(self.current_image_path)
             return
             
-        # Collect styling parameters
+        # Disable UI during rendering
+        self.toggle_ui_state(False)
+        
+        # Get styling parameters
         styling = {
             "font": self.font_var.get(),
             "font_size": self.size_var.get(),
             "color": self.text_color,
             "outline_color": self.outline_color if self.outline_var.get() else None,
+            "outline_width": self.outline_width_var.get(),
             "shadow": self.shadow_var.get(),
-            "alignment": self.align_var.get().lower()
+            "shadow_blur": self.shadow_blur_var.get(),
+            "opacity": self.opacity_var.get(),
+            "alignment": self.align_var.get().lower(),
+            "warp": self.warp_type_var.get().lower() if self.warp_var.get() else None,
+            "warp_strength": self.warp_strength_var.get() / 100.0,
+            "blend_mode": self.blend_mode_var.get().lower()
         }
         
-        # Disable UI during rendering
-        self.status_var.set("Rendering preview...")
-        
-        # Run rendering in a background thread
-        self.current_task = RenderPreviewTask(
-            self.pipeline, 
-            self.image_path,
-            self.selected_proposal["id"],
-            text,
-            styling
-        )
-        self.current_task.start()
+        try:
+            # Render preview using the pipeline
+            print(f"Rendering preview with proposal ID: {self.selected_proposal}")
+            print(f"Text: '{text}'")
+            print(f"Styling: {styling}")
+            
+            rendered_image = self.pipeline.render_preview(
+                self.current_image_path,
+                self.selected_proposal,
+                text,
+                styling
+            )
+            
+            # Convert PIL image to cv2 format for display
+            cv_image = cv2.cvtColor(np.array(rendered_image), cv2.COLOR_RGBA2BGRA)
+            
+            # Display the image
+            self.display_cv_image(cv_image)
+            
+        except Exception as e:
+            print(f"Error rendering preview: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to displaying original image
+            self.display_image(self.current_image_path)
+        finally:
+            # Re-enable UI
+            self.toggle_ui_state(True)
     
     def on_preview_rendered(self, rendered_image):
         """Handle completion of preview rendering"""
@@ -861,99 +1092,107 @@ class MainWindow(tk.Frame):
     def check_tasks(self):
         """Periodically check for completed background tasks"""
         if self.current_task:
-            # Check if task is still running
-            if not hasattr(self.current_task, 'is_alive') or self.current_task.is_alive():
-                # Force UI update to keep it responsive
-                self.update_idletasks()
-                
-                result = self.current_task.get_result()
-                if result:
-                    success, data = result
+            try:
+                # Check if task is still running
+                if hasattr(self.current_task, 'is_alive') and self.current_task.is_alive():
+                    # Force UI update to keep it responsive
+                    self.update_idletasks()
                     
-                    if isinstance(self.current_task, ImageAnalysisTask):
-                        # Handle both progress updates and final results
-                        if success:
-                            # This is the final result - analysis is complete
-                            # Process the actual results
-                            self.on_analysis_complete(data)
-                            
-                            # Make sure the progress bar is removed and status is updated
-                            self.remove_progress_bar()
-                            
-                            if isinstance(data, dict) and "proposals" in data:
-                                self.status_var.set(f"Analysis complete. Found {len(data['proposals'])} potential text regions")
-                            else:
-                                self.status_var.set("Analysis complete")
+                    result = self.current_task.get_result()
+                    if result:
+                        success, data = result
+                        
+                        if isinstance(self.current_task, ImageAnalysisTask):
+                            # Handle both progress updates and final results
+                            if success:
+                                # This is the final result - analysis is complete
+                                # Process the actual results
+                                self.on_analysis_complete(data)
                                 
-                            # Force UI update
-                            self.update_idletasks()
-                            
-                            # Clear the task
-                            self.current_task = None
-                        else:
-                            # Check if it's a progress update or an error
-                            if isinstance(data, dict) and "status" in data:
-                                if data["status"] == "progress":
-                                    # Just a progress update, don't clear the task
-                                    self.on_analysis_complete(data)
-                                    
-                                    # Update the progress bar if percent is provided
-                                    if "percent" in data and hasattr(self, "progress_bar") and self.progress_bar is not None:
-                                        self.progress_bar["value"] = data["percent"]
-                                        # Force update the UI
-                                        self.update_idletasks()
-                                        
-                                        # Update step label if provided
-                                        if "step" in data and hasattr(self, "progress_step_var"):
-                                            step_name = data["step"].capitalize()
-                                            self.progress_step_var.set(f"Step: {step_name}")
-                                            
-                                        # Force update the UI
-                                        self.update_idletasks()
-                                        
-                                        # If we're at a high percentage but not complete, ensure we keep moving
-                                        if data["percent"] > 80 and data["percent"] < 100:
-                                            # Schedule a forced update if we stay at this percentage too long
-                                            self.after(3000, lambda: self._check_progress_stalled(data["percent"]))
-                                else:
-                                    # Error occurred
-                                    error_msg = data.get("message", "Unknown error")
-                                    self.status_var.set(f"Error: {error_msg}")
-                                    
-                                    # Show debug log if available
-                                    if "log" in data:
-                                        self.show_debug_log(data["log"])
-                                        
-                                    self.current_task = None
-                            else:
-                                # Old format error
-                                self.status_var.set(f"Error: {data}")
+                                # Clear the task
                                 self.current_task = None
-            else:
-                # Task has completed but didn't properly clean up
-                self.current_task = None
+                            else:
+                                # Check if it's a progress update or an error
+                                if isinstance(data, dict) and "status" in data:
+                                    if data["status"] == "progress":
+                                        # Just a progress update, don't clear the task
+                                        self.on_analysis_complete(data)
+                                        
+                                        # Schedule next check
+                                        self.after(100, self.check_tasks)
+                                    else:
+                                        # Error or other status
+                                        self.status_var.set(f"Analysis status: {data.get('message', 'Unknown')}")
+                                        self.after(100, self.check_tasks)
+                                else:
+                                    # Handle error
+                                    self.status_var.set(f"Analysis error: {data}")
+                                    self.remove_progress_bar()
+                                    self.analyze_btn["state"] = tk.NORMAL
+                                    self.current_task = None
+                                    messagebox.showerror("Analysis Error", str(data))
+                        elif isinstance(self.current_task, RenderPreviewTask):
+                            if success:
+                                # Preview rendering is complete
+                                self.on_preview_rendered(data)
+                                self.current_task = None
+                            else:
+                                # Error in preview rendering
+                                self.status_var.set(f"Preview error: {data}")
+                                self.current_task = None
+                                messagebox.showerror("Preview Error", str(data))
+                        
+                        # If task is still running, schedule next check
+                        if self.current_task:
+                            self.after(100, self.check_tasks)
+                    else:
+                        # No result yet, schedule next check
+                        self.after(100, self.check_tasks)
+                else:
+                    # Task is no longer running but didn't report a result
+                    # This is likely an error condition
+                    self.status_var.set("Task completed without result, using default region")
+                    self.remove_progress_bar()
+                    self.analyze_btn["state"] = tk.NORMAL
+                    
+                    # Make sure we have a default proposal
+                    if not self.current_proposals or len(self.current_proposals) == 0:
+                        self.add_default_proposal()
+                    
+                    # Select the default proposal
+                    if self.proposals_list.size() > 0 and not self.selected_proposal:
+                        self.proposals_list.selection_set(0)
+                        self.on_proposal_selected(None)
+                    
+                    self.current_task = None
+            except Exception as e:
+                # Handle any exceptions in the task checking
+                print(f"Error checking task: {e}")
+                self.status_var.set(f"Error checking task: {str(e)}")
+                self.remove_progress_bar()
+                self.analyze_btn["state"] = tk.NORMAL
                 
-        # Schedule next check (more frequent checks for better responsiveness)
-        self.after(50, self.check_tasks)
-    
-    def _check_progress_stalled(self, last_percent):
-        """Check if progress has stalled at a high percentage and force completion if needed"""
-        if self.current_task and hasattr(self, "progress_bar") and self.progress_bar is not None:
-            current_percent = self.progress_bar["value"]
-            # If we're still at the same percentage after 3 seconds, force progress
-            if current_percent == last_percent and current_percent > 80 and current_percent < 100:
-                # Force progress to move forward
-                new_percent = min(100, current_percent + 5)
-                self.progress_bar["value"] = new_percent
-                self.progress_step_var.set("Step: Finalizing")
-                self.update_idletasks()
-                # Check again in 2 seconds if still not complete
-                if new_percent < 100:
-                    self.after(2000, lambda: self._check_progress_stalled(new_percent))
+                # Make sure we have a default proposal
+                if not self.current_proposals or len(self.current_proposals) == 0:
+                    self.add_default_proposal()
+                
+                # Select the default proposal
+                if self.proposals_list.size() > 0 and not self.selected_proposal:
+                    self.proposals_list.selection_set(0)
+                    self.on_proposal_selected(None)
+                
+                self.current_task = None
     
     def on_export(self):
         """Handle export button click"""
-        if not self.preview_image or not self.selected_proposal:
+        if not self.selected_proposal or not self.current_image_path:
+            messagebox.showerror("Export Error", "No image or region selected")
+            return
+            
+        # Get text from input field
+        text = self.text_input.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showerror("Export Error", "No text entered")
             return
             
         # Get export path
@@ -964,49 +1203,199 @@ class MainWindow(tk.Frame):
         )
         
         if not file_path:
-            return
+            return  # User cancelled
             
-        # Get DPI setting
-        dpi_text = self.dpi_var.get()
-        if "72" in dpi_text:
-            dpi = 72
-        elif "150" in dpi_text:
-            dpi = 150
-        elif "600" in dpi_text:
-            dpi = 600
-        else:
-            dpi = 300
-            
-        # Update pipeline DPI
-        self.pipeline.text_renderer.dpi = dpi
+        # Show export options dialog
+        self.show_export_options(text, file_path)
+    
+    
+    def show_export_options(self, text, output_path):
+        """Show dialog with export options"""
+        # Create a dialog window
+        dialog = tk.Toplevel(self)
+        dialog.title("Export Options")
+        dialog.geometry("400x300")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
         
-        # Get text and styling
-        text = self.text_input.get("1.0", tk.END).strip()
-        styling = {
-            "font": self.font_var.get(),
-            "font_size": self.size_var.get(),
-            "color": self.text_color,
-            "outline_color": self.outline_color if self.outline_var.get() else None,
-            "shadow": self.shadow_var.get(),
-            "alignment": self.align_var.get().lower()
-        }
+        # Create a frame for the options
+        options_frame = ttk.Frame(dialog, padding=10)
+        options_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Render and save final image
-        try:
-            self.status_var.set(f"Exporting image to {file_path}...")
-            
-            output_path = self.pipeline.render_final(
-                self.image_path,
-                text,
-                self.selected_proposal["region"],
-                styling,
-                file_path
+        # Quality options
+        ttk.Label(options_frame, text="Quality:").grid(column=0, row=0, sticky=tk.W, padx=5, pady=5)
+        quality_var = tk.IntVar(value=95)
+        quality_spin = ttk.Spinbox(options_frame, from_=1, to=100, textvariable=quality_var, width=5)
+        quality_spin.grid(column=1, row=0, sticky=tk.W, padx=5, pady=5)
+        
+        # Resolution options
+        ttk.Label(options_frame, text="Resolution:").grid(column=0, row=1, sticky=tk.W, padx=5, pady=5)
+        resolution_var = tk.StringVar(value="Original")
+        resolution_combo = ttk.Combobox(options_frame, textvariable=resolution_var, state="readonly")
+        resolution_combo["values"] = ("Original", "1080p", "4K", "Custom")
+        resolution_combo.grid(column=1, row=1, sticky=tk.W, padx=5, pady=5)
+        
+        # DPI options
+        ttk.Label(options_frame, text="DPI:").grid(column=0, row=2, sticky=tk.W, padx=5, pady=5)
+        dpi_var = tk.IntVar(value=300)
+        dpi_spin = ttk.Spinbox(options_frame, from_=72, to=600, textvariable=dpi_var, width=5)
+        dpi_spin.grid(column=1, row=2, sticky=tk.W, padx=5, pady=5)
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        cancel_btn = ttk.Button(button_frame, text="Cancel", command=dialog.destroy)
+        cancel_btn.pack(side=tk.RIGHT, padx=5)
+        
+        export_btn = ttk.Button(
+            button_frame, 
+            text="Export", 
+            command=lambda: self.do_export(
+                text, 
+                output_path, 
+                quality_var.get(), 
+                dpi_var.get(),
+                dialog
             )
+        )
+        export_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Center the dialog on the parent window
+        dialog.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+    def do_export(self, text, output_path, quality, dpi, dialog=None):
+        """Export the rendered image with the given options"""
+        try:
+            # Show a progress dialog
+            progress_dialog = tk.Toplevel(self)
+            progress_dialog.title("Exporting...")
+            progress_dialog.geometry("300x100")
+            progress_dialog.resizable(False, False)
+            progress_dialog.transient(self)
+            progress_dialog.grab_set()
             
-            self.status_var.set(f"Image exported to {output_path}")
+            # Add a progress bar
+            ttk.Label(progress_dialog, text="Exporting image...").pack(pady=10)
+            progress = ttk.Progressbar(progress_dialog, orient=tk.HORIZONTAL, length=200, mode='indeterminate')
+            progress.pack(pady=10)
+            progress.start()
+            
+            # Center the dialog
+            progress_dialog.update_idletasks()
+            x = self.winfo_x() + (self.winfo_width() - progress_dialog.winfo_width()) // 2
+            y = self.winfo_y() + (self.winfo_height() - progress_dialog.winfo_height()) // 2
+            progress_dialog.geometry(f"+{x}+{y}")
+            
+            # Find the selected proposal object by ID
+            selected_proposal_obj = None
+            for proposal in self.current_proposals:
+                if isinstance(proposal, dict) and str(proposal.get("id")) == str(self.selected_proposal):
+                    selected_proposal_obj = proposal
+                    break
+            
+            if not selected_proposal_obj:
+                # Create a default centered region if no proposal is found
+                img = cv2.imread(self.current_image_path)
+                if img is not None:
+                    height, width = img.shape[:2]
+                    selected_proposal_obj = {
+                        "id": "default_center",
+                        "x": int(width * 0.2),
+                        "y": int(height * 0.2),
+                        "width": int(width * 0.6),
+                        "height": int(height * 0.6),
+                        "score": 1.0
+                    }
+            
+            # Create a thread to perform the export
+            def export_thread():
+                try:
+                    # Get the region from the selected proposal
+                    region = {
+                        "x": selected_proposal_obj["x"],
+                        "y": selected_proposal_obj["y"],
+                        "width": selected_proposal_obj["width"],
+                        "height": selected_proposal_obj["height"],
+                        "rotation": selected_proposal_obj.get("rotation", 0)
+                    }
+                    
+                    # Get styling parameters
+                    styling = {
+                        "font": self.font_var.get(),
+                        "font_size": self.size_var.get(),
+                        "color": self.text_color,
+                        "outline_color": self.outline_color if self.outline_var.get() else None,
+                        "outline_width": self.outline_width_var.get(),
+                        "shadow": self.shadow_var.get(),
+                        "shadow_blur": self.shadow_blur_var.get(),
+                        "opacity": self.opacity_var.get(),
+                        "alignment": self.align_var.get().lower(),
+                        "warp": self.warp_type_var.get().lower() if self.warp_var.get() else None,
+                        "warp_strength": self.warp_strength_var.get() / 100.0,
+                        "blend_mode": self.blend_mode_var.get().lower()
+                    }
+                    
+                    # Render and save
+                    output_path = self.pipeline.render_final(
+                        self.current_image_path,
+                        text,
+                        region,
+                        styling,
+                        output_path,
+                        quality
+                    )
+                    
+                    # Close the progress dialog
+                    self.after(0, progress_dialog.destroy)
+                    
+                    # Show success message
+                    self.after(0, lambda: messagebox.showinfo(
+                        "Export Complete", 
+                        f"Image exported successfully to:\n{output_path}"
+                    ))
+                    
+                    # Close the options dialog if it exists
+                    if dialog:
+                        self.after(0, dialog.destroy)
+                        
+                except Exception as e:
+                    # Close the progress dialog
+                    self.after(0, progress_dialog.destroy)
+                    
+                    # Show error message
+                    self.after(0, lambda: messagebox.showerror(
+                        "Export Error", 
+                        f"Error exporting image: {str(e)}"
+                    ))
+                    print(f"Export error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Start the export thread
+            threading.Thread(target=export_thread, daemon=True).start()
+            
         except Exception as e:
-            self.status_var.set(f"Error during export: {str(e)}")
-            messagebox.showerror("Export Error", str(e))
+            messagebox.showerror("Export Error", f"Error setting up export: {str(e)}")
+            print(f"Export setup error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_export_complete(self, progress_dialog, output_path):
+        """Handle completion of export process"""
+        progress_dialog.destroy()
+        messagebox.showinfo("Export Complete", f"Image exported successfully to:\n{output_path}")
+        self.status_var.set(f"Image exported to {output_path}")
+        
+    def _on_export_error(self, progress_dialog, error_message):
+        """Handle export error"""
+        progress_dialog.destroy()
+        messagebox.showerror("Export Error", f"Failed to export image: {error_message}")
+        self.status_var.set("Export failed")
     
     def display_image(self, image_path):
         """Display an image from file path"""
@@ -1025,7 +1414,7 @@ class MainWindow(tk.Frame):
         # Update canvas scrollregion
         self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
     
-    def display_opencv_image(self, cv_image):
+    def display_cv_image(self, cv_image):
         """Display an OpenCV image"""
         # Convert OpenCV image (BGR) to RGB
         cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
@@ -1044,6 +1433,50 @@ class MainWindow(tk.Frame):
         
         # Update canvas scrollregion
         self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
+    
+    def toggle_ui_state(self, enabled):
+        """Toggle the state of UI elements"""
+        self.analyze_btn["state"] = tk.NORMAL if enabled else tk.DISABLED
+        self.export_btn["state"] = tk.NORMAL if enabled and self.selected_proposal else tk.DISABLED
+        self.text_input["state"] = tk.NORMAL if enabled else tk.DISABLED
+        self.font_combo["state"] = "readonly" if enabled else tk.DISABLED
+        self.size_var.set(self.size_var.get())  # Trigger update
+        
+        # Fix color button reference
+        # self.color_btn["state"] = tk.NORMAL if enabled else tk.DISABLED
+        
+        self.outline_var.set(self.outline_var.get())  # Trigger update
+        if hasattr(self, 'outline_btn'):
+            if enabled and self.outline_var.get():
+                self.outline_btn["state"] = tk.NORMAL
+            else:
+                self.outline_btn["state"] = tk.DISABLED
+                
+        self.opacity_var.set(self.opacity_var.get())  # Trigger update
+        self.shadow_var.set(self.shadow_var.get())  # Trigger update
+        self.shadow_blur_var.set(self.shadow_blur_var.get())  # Trigger update
+        self.blend_mode_combo["state"] = "readonly" if enabled else tk.DISABLED
+        self.warp_var.set(self.warp_var.get())  # Trigger update
+        self.warp_type_combo["state"] = "readonly" if enabled and self.warp_var.get() else tk.DISABLED
+        self.warp_strength_var.set(self.warp_strength_var.get())  # Trigger update
+        self.align_var.set(self.align_var.get())  # Trigger update
+        self.dpi_combo["state"] = "readonly" if enabled else tk.DISABLED
+
+    def on_color_select(self):
+        """Handle text color selection"""
+        color = colorchooser.askcolor(initialcolor=self.text_color, title="Select Text Color")
+        if color[1]:  # color is ((r,g,b), hexcode)
+            self.text_color = color[1]
+            self.color_indicator.config(bg=self.text_color)
+            self.update_preview()
+            
+    def on_outline_color_select(self):
+        """Handle outline color selection"""
+        color = colorchooser.askcolor(initialcolor=self.outline_color, title="Select Outline Color")
+        if color[1]:  # color is ((r,g,b), hexcode)
+            self.outline_color = color[1]
+            self.outline_indicator.config(bg=self.outline_color)
+            self.update_preview()
     
 def run_application():
     """Run the application"""

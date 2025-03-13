@@ -8,6 +8,8 @@ import math
 from typing import Tuple, Dict, Any, Optional, List
 
 
+import os
+
 class TextRenderer:
     """
     High-quality vector-based text renderer with support for transformations,
@@ -26,7 +28,7 @@ class TextRenderer:
         
         # Scale factor for high-resolution rendering
         # We render at a higher resolution and then scale down for better quality
-        self.scale_factor = max(1, self.dpi // 72)
+        self.scale_factor = max(2, self.dpi // 72)
     
     def render_text(self, image_path: str, text: str, region: Dict[str, Any], 
                    styling: Optional[Dict[str, Any]] = None) -> Image.Image:
@@ -72,7 +74,7 @@ class TextRenderer:
         """
         return {
             "font": self.default_font,
-            "font_size": 24,
+            "font_size": 72,
             "color": "black",
             "outline_color": None,  # No outline by default
             "outline_width": 1,
@@ -151,21 +153,30 @@ class TextRenderer:
             opacity = int(255 * styling["opacity"])
             text_color = text_color + (opacity,)
         
-        # Render shadow if enabled
+        # Create a separate layer for shadow if enabled
+        shadow_layer = None
         if styling["shadow"]:
-            shadow_x = text_x + styling["shadow_offset"][0] * sf
-            shadow_y = text_y + styling["shadow_offset"][1] * sf
+            shadow_layer = Image.new("RGBA", hi_res_size, (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow_layer)
+            
+            # Get shadow parameters
+            shadow_offset = styling.get("shadow_offset", (3, 3))
+            shadow_color = styling.get("shadow_color", (0, 0, 0, 128))
+            shadow_blur = styling.get("shadow_blur", 5)
+            
+            # Scale shadow parameters
+            shadow_offset = (shadow_offset[0] * sf, shadow_offset[1] * sf)
+            shadow_blur = shadow_blur * sf / 3
             
             # Draw shadow text
-            draw.text((shadow_x, shadow_y), text, font=font, fill=styling["shadow_color"])
+            shadow_x = text_x + shadow_offset[0]
+            shadow_y = text_y + shadow_offset[1]
+            shadow_draw.text((shadow_x, shadow_y), text, font=font, fill=shadow_color)
             
-            # Apply blur to the entire layer for the shadow
-            hi_res_text_layer = hi_res_text_layer.filter(
-                ImageFilter.GaussianBlur(radius=styling["shadow_blur"] * sf / 3)
+            # Apply blur to the shadow layer
+            shadow_layer = shadow_layer.filter(
+                ImageFilter.GaussianBlur(radius=shadow_blur)
             )
-            
-            # Create a new draw object after the filter
-            draw = ImageDraw.Draw(hi_res_text_layer)
         
         # Draw outline if specified
         if styling["outline_color"]:
@@ -178,8 +189,10 @@ class TextRenderer:
                 opacity = int(255 * styling["opacity"])
                 outline_color = outline_color + (opacity,)
                 
+            # Get outline width
+            outline_width = max(1, int(styling.get("outline_width", 1) * sf))
+            
             # Draw text multiple times for outline effect
-            outline_width = max(1, int(styling["outline_width"] * sf))
             for offset_x in range(-outline_width, outline_width + 1, max(1, outline_width // 2)):
                 for offset_y in range(-outline_width, outline_width + 1, max(1, outline_width // 2)):
                     if offset_x == 0 and offset_y == 0:
@@ -213,6 +226,14 @@ class TextRenderer:
                 expand=False
             )
         
+        # Composite shadow if it exists
+        if shadow_layer:
+            # Create a new layer with the shadow
+            composite_layer = Image.new("RGBA", hi_res_size, (0, 0, 0, 0))
+            composite_layer = Image.alpha_composite(composite_layer, shadow_layer)
+            composite_layer = Image.alpha_composite(composite_layer, hi_res_text_layer)
+            hi_res_text_layer = composite_layer
+        
         # Scale back down to original resolution
         final_text_layer = hi_res_text_layer.resize(
             (text_layer.width, text_layer.height),
@@ -236,8 +257,16 @@ class TextRenderer:
         Returns:
             Transformed PIL Image
         """
-        warp_type = warp_params.get("type", "perspective")
-        strength = warp_params.get("strength", 0.2)
+        if isinstance(warp_params, bool) and warp_params:
+            # Default to perspective warp with medium strength if just boolean True
+            warp_type = "perspective"
+            strength = 0.2
+        elif isinstance(warp_params, dict):
+            warp_type = warp_params.get("type", "perspective").lower()
+            strength = warp_params.get("strength", 0.2)
+        else:
+            # No warping if parameters are invalid
+            return image
         
         width, height = image.size
         
@@ -250,56 +279,130 @@ class TextRenderer:
                 (0, height)
             ]
             
-            # Calculate destination points based on strength
-            offset_x = int(width * strength)
-            offset_y = int(height * strength * 0.5)
-            
+            # Apply distortion based on strength
             dst_points = [
-                (offset_x, 0),
-                (width - offset_x, 0),
-                (width, height),
-                (0, height)
+                (0 + width * strength * 0.5, 0 + height * strength * 0.1),
+                (width - width * strength * 0.5, 0 + height * strength * 0.1),
+                (width - width * strength * 0.2, height - height * strength * 0.1),
+                (0 + width * strength * 0.2, height - height * strength * 0.1)
             ]
             
-            # Calculate perspective transform matrix
+            # Find transformation coefficients
             coeffs = self._find_coeffs(dst_points, src_points)
             
-            # Apply perspective transform
-            return image.transform(
-                image.size, 
-                Image.PERSPECTIVE, 
-                coeffs,
-                Image.BICUBIC
-            )
+            # Apply the transformation
+            return image.transform(image.size, Image.PERSPECTIVE, coeffs, Image.BICUBIC)
             
         elif warp_type == "arc":
-            # Arc/curve warping
-            # Convert PIL image to numpy array for easier pixel manipulation
-            img_np = np.array(image)
-            
-            # Create output array
-            result = np.zeros_like(img_np)
+            # Create an arc/bend effect
+            result = Image.new("RGBA", image.size, (0, 0, 0, 0))
             
             # Calculate arc parameters
-            amplitude = height * strength
+            bend_amount = int(height * strength)
             
-            # Apply arc transformation
-            for y in range(height):
-                for x in range(width):
-                    # Calculate offset based on arc equation
-                    x_offset = int(amplitude * math.sin(math.pi * x / width))
-                    
-                    new_y = y + x_offset
-                    
-                    # Ensure we stay within bounds
-                    if 0 <= new_y < height:
-                        result[new_y, x] = img_np[y, x]
+            for x in range(width):
+                # Calculate vertical shift for this column
+                # Creates an arc shape (parabola)
+                rel_x = (x / width - 0.5) * 2  # -1 to 1
+                shift = int(bend_amount * (1 - rel_x * rel_x))
+                
+                # Copy column with shift
+                for y in range(height):
+                    if 0 <= y - shift < height:
+                        result.putpixel((x, y), image.getpixel((x, y - shift)))
             
-            # Convert back to PIL image
-            return Image.fromarray(result)
+            return result
+            
+        elif warp_type == "wave":
+            # Create a wave effect
+            result = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            
+            # Wave parameters
+            amplitude = int(height * strength * 0.2)
+            frequency = 2 * math.pi / width * 3  # 3 waves across the width
+            
+            for x in range(width):
+                # Calculate sine wave shift
+                shift = int(amplitude * math.sin(x * frequency))
+                
+                # Copy column with shift
+                for y in range(height):
+                    if 0 <= y - shift < height:
+                        result.putpixel((x, y), image.getpixel((x, y - shift)))
+            
+            return result
         
-        # Default: no warping
-        return image
+        else:
+            # Unknown warp type, return original
+            return image
+    
+    def _apply_blend_mode(self, background: Image.Image, foreground: Image.Image, 
+                         blend_mode: str) -> Image.Image:
+        """
+        Apply blend mode between foreground and background
+        
+        Args:
+            background: Background PIL Image
+            foreground: Foreground PIL Image
+            blend_mode: String specifying the blend mode
+            
+        Returns:
+            Blended PIL Image
+        """
+        # Convert blend mode to lowercase for case-insensitive comparison
+        blend_mode = blend_mode.lower()
+        
+        # Create a copy of the foreground
+        result = foreground.copy()
+        
+        # Apply different blend modes
+        if blend_mode == "multiply":
+            # Multiply blend mode
+            bg_arr = np.array(background).astype(np.float32) / 255
+            fg_arr = np.array(foreground).astype(np.float32) / 255
+            
+            # Multiply the RGB channels
+            blended = bg_arr * fg_arr
+            
+            # Convert back to 8-bit
+            blended = (blended * 255).astype(np.uint8)
+            
+            # Create new image
+            result = Image.fromarray(blended)
+            
+        elif blend_mode == "screen":
+            # Screen blend mode
+            bg_arr = np.array(background).astype(np.float32) / 255
+            fg_arr = np.array(foreground).astype(np.float32) / 255
+            
+            # Screen formula: 1 - (1 - a) * (1 - b)
+            blended = 1 - (1 - bg_arr) * (1 - fg_arr)
+            
+            # Convert back to 8-bit
+            blended = (blended * 255).astype(np.uint8)
+            
+            # Create new image
+            result = Image.fromarray(blended)
+            
+        elif blend_mode == "overlay":
+            # Overlay blend mode
+            bg_arr = np.array(background).astype(np.float32) / 255
+            fg_arr = np.array(foreground).astype(np.float32) / 255
+            
+            # Overlay formula: if bg < 0.5: 2 * bg * fg, else: 1 - 2 * (1 - bg) * (1 - fg)
+            mask = bg_arr < 0.5
+            blended = np.zeros_like(bg_arr)
+            blended[mask] = 2 * bg_arr[mask] * fg_arr[mask]
+            blended[~mask] = 1 - 2 * (1 - bg_arr[~mask]) * (1 - fg_arr[~mask])
+            
+            # Convert back to 8-bit
+            blended = (blended * 255).astype(np.uint8)
+            
+            # Create new image
+            result = Image.fromarray(blended)
+        
+        # For normal blend mode, just return the foreground
+        return result
     
     def _find_coeffs(self, pa: List[Tuple[int, int]], pb: List[Tuple[int, int]]) -> List[float]:
         """
@@ -322,64 +425,6 @@ class TextRenderer:
 
         res = np.dot(np.linalg.inv(A.T * A) * A.T, B)
         return np.array(res).reshape(8).tolist()
-    
-    def _apply_blend_mode(self, background: Image.Image, foreground: Image.Image, 
-                         blend_mode: str) -> Image.Image:
-        """
-        Apply blend mode between foreground and background
-        
-        Args:
-            background: Background PIL Image
-            foreground: Foreground PIL Image
-            blend_mode: String specifying the blend mode
-            
-        Returns:
-            Blended PIL Image
-        """
-        # Convert to numpy arrays for easier manipulation
-        bg = np.array(background).astype(float) / 255
-        fg = np.array(foreground).astype(float) / 255
-        
-        # Extract alpha channel
-        if bg.shape[2] == 4:
-            bg_alpha = bg[:, :, 3:4]
-            bg_rgb = bg[:, :, :3]
-        else:
-            bg_alpha = np.ones((*bg.shape[:2], 1))
-            bg_rgb = bg
-            
-        if fg.shape[2] == 4:
-            fg_alpha = fg[:, :, 3:4]
-            fg_rgb = fg[:, :, :3]
-        else:
-            fg_alpha = np.ones((*fg.shape[:2], 1))
-            fg_rgb = fg
-        
-        # Apply blend mode
-        if blend_mode == "multiply":
-            blended_rgb = bg_rgb * fg_rgb
-        elif blend_mode == "screen":
-            blended_rgb = 1 - (1 - bg_rgb) * (1 - fg_rgb)
-        elif blend_mode == "overlay":
-            mask = bg_rgb <= 0.5
-            blended_rgb = np.zeros_like(bg_rgb)
-            blended_rgb[mask] = 2 * bg_rgb[mask] * fg_rgb[mask]
-            blended_rgb[~mask] = 1 - 2 * (1 - bg_rgb[~mask]) * (1 - fg_rgb[~mask])
-        else:  # normal or unknown mode
-            blended_rgb = fg_rgb
-            
-        # Combine alpha using Porter-Duff "over" operation
-        blended_alpha = fg_alpha + bg_alpha * (1 - fg_alpha)
-        
-        # Combine RGB with alpha
-        blended = np.concatenate([
-            blended_rgb * fg_alpha + bg_rgb * bg_alpha * (1 - fg_alpha),
-            blended_alpha
-        ], axis=2)
-        
-        # Convert back to PIL Image
-        blended_uint8 = (blended * 255).astype(np.uint8)
-        return Image.fromarray(blended_uint8)
     
     def save_output(self, image: Image.Image, output_path: str, quality: int = 95) -> None:
         """

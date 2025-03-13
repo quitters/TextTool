@@ -23,6 +23,15 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Backup files
+*.bak*
+
+# Temporary fix scripts
+fix_*.py
+
+# Fixed files that are not part of the main codebase
+ui/fixed_*.py
+
 # Project specific
 *.log
 output/
